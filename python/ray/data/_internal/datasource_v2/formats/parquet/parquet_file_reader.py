@@ -36,11 +36,12 @@ from ray.data._internal.datasource_v2.formats.parquet.parquet_size_estimator imp
     PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
 )
 from ray.data._internal.datasource_v2.formats.parquet.parquet_utils import (
+    _decoded_size_estimate_enabled,
     _get_safe_batch_size_for_nested_types,
     _needs_nested_type_fallback,
     _resolve_leaf_column_indices,
     _resolve_read_columns,
-    _row_group_uncompressed_size,
+    _row_group_budget_size,
 )
 from ray.data._internal.datasource_v2.interfaces.file_manifest import FileManifest
 from ray.data._internal.datasource_v2.interfaces.read_units import (
@@ -86,9 +87,9 @@ def _estimate_batch_size_from_metadata(
 ) -> Optional[int]:
     """Estimate batch size from Parquet row group metadata without reading data.
 
-    Uses uncompressed column sizes from row group metadata and the encoding
-    ratio to estimate in-memory row size, then computes how many rows fit
-    in ``target_block_size``.
+    Uses the footer's decoded-size estimate for the first row group (see
+    :func:`_row_group_decoded_size_estimate`) to estimate in-memory row size,
+    then computes how many rows fit in ``target_block_size``.
 
     Args:
         fragment: A PyArrow Parquet fragment with accessible metadata.
@@ -123,9 +124,7 @@ def _estimate_batch_size_from_metadata(
 
     # ``None`` sums every column; a projection narrows it to the matching leaves
     # (a nested field expands to several, e.g. "a.b.list.element"). Shared with
-    # the footer path so the two cannot drift, and it deliberately avoids
-    # ``total_byte_size``, which can report the *compressed* size for some files
-    # (apache/arrow#48138).
+    # the footer path so the two cannot drift.
     projected_leaf_indices: Optional[List[int]] = None
     if columns is not None:
         projected_columns = set(columns)
@@ -136,13 +135,9 @@ def _estimate_batch_size_from_metadata(
                 row_group_meta.column(col_idx).path_in_schema, projected_columns
             )
         ]
-    row_group_uncompressed_size = _row_group_uncompressed_size(
-        row_group_meta, projected_leaf_indices
-    )
-
-    # Estimate the in-memory size of the row group
     estimated_in_mem_row_group_size = (
-        row_group_uncompressed_size * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+        _row_group_budget_size(row_group_meta, metadata.schema, projected_leaf_indices)
+        * _budget_to_in_memory_ratio()
     )
 
     estimated_in_mem_row_size = estimated_in_mem_row_group_size / row_group_num_rows
@@ -163,15 +158,26 @@ def _estimate_batch_size_from_metadata(
     return target_batch_size
 
 
+def _budget_to_in_memory_ratio() -> float:
+    """Multiplier from :func:`_row_group_budget_size` to in-memory bytes.
+
+    The decoded-size estimate already is an in-memory size. With it disabled,
+    the budget is the encoded size, so apply the legacy fixed encoding ratio.
+    """
+    if _decoded_size_estimate_enabled():
+        return 1
+    return PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+
+
 def _estimate_batch_size_from_chunk_stats(
-    uncompressed_size: int,
+    estimated_size: int,
     num_rows: int,
     target_block_size: int,
 ) -> Optional[int]:
     """Estimate batch size from footer-derived chunk stats, without any I/O.
 
     ``ListFiles`` already read each file's footer and recorded the
-    projection-scoped uncompressed byte size and row count of the row groups it
+    projection-scoped decoded-size estimate and row count of the row groups it
     assigned to this chunk (the ``size_bytes`` and ``num_rows`` of its
     :class:`FileChunk`). Sizing from
     those avoids the extra footer read that
@@ -179,11 +185,9 @@ def _estimate_batch_size_from_chunk_stats(
     math but over the whole chunk (its row-group average) rather than the first
     row group; the estimate is refined from real data after the first batch.
     """
-    if num_rows <= 0 or uncompressed_size <= 0:
+    if num_rows <= 0 or estimated_size <= 0:
         return None
-    estimated_in_mem_row_size = (
-        uncompressed_size * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT / num_rows
-    )
+    estimated_in_mem_row_size = estimated_size * _budget_to_in_memory_ratio() / num_rows
     if estimated_in_mem_row_size == 0:
         return None
     # Never request more rows than the chunk actually contains.

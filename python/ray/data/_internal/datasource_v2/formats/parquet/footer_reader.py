@@ -18,7 +18,7 @@ from ray.data._internal.datasource_v2.formats.parquet.parquet_row_group_coalesci
     coalesce_row_groups,
 )
 from ray.data._internal.datasource_v2.formats.parquet.parquet_utils import (
-    _row_group_uncompressed_size,
+    _row_group_budget_size,
 )
 from ray.data._internal.datasource_v2.interfaces.file_indexer import FileInfo
 from ray.data._internal.datasource_v2.interfaces.file_manifest import FileChunk
@@ -180,20 +180,19 @@ class FooterReader:
         row_group: RowGroupMetaData,
         rg_idx: int,
         leaf_indices: list[int] | None,
+        schema: ParquetSchema,
         fully_matched: bool = False,
     ) -> FileChunk:
-        # Sum per-column sizes on both paths -- with a projection, only the
-        # leaves the reader decodes, so bin packing reflects the bytes it will
-        # actually pull. Deliberately not ``row_group.total_byte_size``, which
-        # is one cheap accessor but can report the *compressed* size for some
-        # files (apache/arrow#48138); undersizing bins here overfills read
-        # tasks, which is the failure this whole path exists to avoid. Shares
-        # the V1 helper so the three call sites cannot drift.
-        uncompressed = _row_group_uncompressed_size(row_group, leaf_indices)
+        # Budget on the estimated *decoded* size of the leaves the reader will
+        # decode (only the projected ones under a projection). Parquet's
+        # uncompressed size is the encoded page size, which dictionary/RLE
+        # encoding can shrink several-fold below the Arrow size, so bins sized
+        # on it overfill read tasks and their output blocks. Shared with the
+        # reader's batch sizing so the two cannot drift.
         return FileChunk(
             unit_ids=(rg_idx,),
             num_rows=row_group.num_rows,
-            size_bytes=uncompressed,
+            size_bytes=_row_group_budget_size(row_group, schema, leaf_indices),
             fully_matched=fully_matched,
         )
 
@@ -369,6 +368,7 @@ class FooterReader:
                 row_group=metadata.row_group(rg_idx),
                 rg_idx=rg_idx,
                 leaf_indices=leaf_indices,
+                schema=metadata.schema,
                 fully_matched=fully_by_idx.get(rg_idx, True),
             )
             for rg_idx in rg_indices

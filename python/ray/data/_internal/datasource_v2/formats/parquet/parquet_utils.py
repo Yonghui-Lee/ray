@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import pyarrow as pa
 
+from ray._common.utils import env_bool
 from ray.data._internal.util import GiB
 
 if TYPE_CHECKING:
@@ -120,6 +121,128 @@ def _row_group_uncompressed_size(
     """
     indices = range(rg_meta.num_columns) if column_indices is None else column_indices
     return sum(rg_meta.column(i).total_uncompressed_size for i in indices)
+
+
+# Decoded Arrow bytes per value for fixed-width Parquet physical types, used
+# when the leaf's logical type does not narrow or widen the Arrow type.
+_PHYSICAL_TYPE_WIDTH = {
+    "BOOLEAN": 1 / 8,  # Arrow booleans are bit-packed
+    "INT32": 4,
+    "INT64": 8,
+    "INT96": 8,  # read as timestamp[ns]
+    "FLOAT": 4,
+    "DOUBLE": 8,
+}
+# Arrow widths of integer logical types stored in a wider physical type
+# (e.g. INT_8 is stored as INT32 but read as int8).
+_INT_CONVERTED_TYPE_WIDTH = {
+    "INT_8": 1,
+    "UINT_8": 1,
+    "INT_16": 2,
+    "UINT_16": 2,
+    "INT_32": 4,
+    "UINT_32": 4,
+    "INT_64": 8,
+    "UINT_64": 8,
+}
+# Largest decimal precision that Arrow reads as decimal128 (16 bytes); wider
+# decimals are read as decimal256 (32 bytes), whatever their physical type.
+_DECIMAL128_MAX_PRECISION = 38
+# Arrow list offsets are int32.
+_LIST_OFFSET_WIDTH = 4
+
+# Set to 0 to budget Parquet bins and batches on the encoded
+# ``total_uncompressed_size`` (times a fixed ratio for batches), as before the
+# decoded-size estimate existed.
+DECODED_SIZE_ESTIMATE_ENV = "RAY_DATA_PARQUET_DECODED_SIZE_ESTIMATE"
+
+
+def _decoded_size_estimate_enabled() -> bool:
+    return env_bool(DECODED_SIZE_ESTIMATE_ENV, True)
+
+
+def _leaf_decoded_width(
+    leaf: "pyarrow.parquet.ColumnSchema", physical_type: str
+) -> Optional[float]:
+    """Arrow bytes per value of a fixed-width leaf, or ``None`` if variable."""
+    converted_type = leaf.converted_type
+    if converted_type == "DECIMAL" or leaf.logical_type.type == "DECIMAL":
+        return 16 if leaf.precision <= _DECIMAL128_MAX_PRECISION else 32
+    int_width = _INT_CONVERTED_TYPE_WIDTH.get(converted_type)
+    if int_width is not None:
+        return int_width
+    if physical_type == "FIXED_LEN_BYTE_ARRAY":
+        # fixed_size_binary, float16, uuid, ...: stored at the Arrow width.
+        return leaf.length or None
+    return _PHYSICAL_TYPE_WIDTH.get(physical_type)
+
+
+def _row_group_decoded_size_estimate(
+    rg_meta: "pyarrow.parquet.RowGroupMetaData",
+    schema: "pyarrow.parquet.ParquetSchema",
+    column_indices: Optional[List[int]] = None,
+) -> int:
+    """Estimate a row group's in-memory (decoded Arrow) size from the footer.
+
+    Parquet's ``total_uncompressed_size`` is the *encoded* page size: after
+    dictionary / RLE / delta encoding but before compression. Decoding can
+    expand it several-fold (a dictionary-encoded ``list<int64>`` token column
+    decodes ~4x larger), so budgeting on it overfills read tasks and blocks.
+
+    Fixed-width leaves are sized from the column chunk's value count:
+    ``num_values * width``, where *width* is the Arrow width implied by the
+    leaf's logical type (``decimal(9, 2)`` stored in 4 bytes is read as a
+    16-byte decimal128, ``INT_8`` stored as INT32 is read as int8). Every
+    repeated level (``max_repetition_level``) adds one int32 offset per list:
+    the outer level has one list per row, deeper levels are bounded by the
+    value count. Variable-width (``BYTE_ARRAY``) leaves fall back to their
+    uncompressed size, which is close to the decoded size for plain-encoded
+    data, but never less than their offsets. Validity bitmaps are ignored (at
+    most 1 bit per value).
+
+    Fixed-width estimates are the exact Arrow value bytes, so they are not
+    floored at the encoded size (a high-cardinality dictionary page can encode
+    *larger* than the decoded values). Variable-width estimates are never
+    below the encoded size that was budgeted before.
+
+    When *column_indices* is ``None`` all leaves are summed, otherwise only the
+    listed leaf-column indices are included.
+    """
+    indices = range(rg_meta.num_columns) if column_indices is None else column_indices
+    num_rows = rg_meta.num_rows
+    total = 0.0
+    for i in indices:
+        chunk = rg_meta.column(i)
+        leaf = schema.column(i)
+        num_values = chunk.num_values
+        width = _leaf_decoded_width(leaf, chunk.physical_type)
+        if width is not None:
+            leaf_bytes = num_values * width
+        else:
+            leaf_bytes = max(
+                chunk.total_uncompressed_size,
+                (num_values + 1) * _LIST_OFFSET_WIDTH,
+            )
+        for level in range(leaf.max_repetition_level):
+            num_lists = num_rows if level == 0 else num_values
+            leaf_bytes += (num_lists + 1) * _LIST_OFFSET_WIDTH
+        total += leaf_bytes
+    return int(total)
+
+
+def _row_group_budget_size(
+    rg_meta: "pyarrow.parquet.RowGroupMetaData",
+    schema: "pyarrow.parquet.ParquetSchema",
+    column_indices: Optional[List[int]] = None,
+) -> int:
+    """Bytes a row group counts against bin and batch budgets.
+
+    The decoded-size estimate, or the encoded uncompressed size when
+    ``RAY_DATA_PARQUET_DECODED_SIZE_ESTIMATE=0``.
+    """
+    if _decoded_size_estimate_enabled():
+        return _row_group_decoded_size_estimate(rg_meta, schema, column_indices)
+    return _row_group_uncompressed_size(rg_meta, column_indices)
 
 
 def _resolve_leaf_column_indices(
